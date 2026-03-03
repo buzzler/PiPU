@@ -217,9 +217,27 @@ int main()
 	pthread_mutex_init(&bufferswitchmutex, NULL);
 	pthread_cond_init(&outfullcond, NULL);
 
-	fp = fopen("testframe.bgra", "r");
+	fp = fopen("testframe.bgra", "rb");
+	if (!fp)
+	{
+		printf("Warning: testframe.bgra not found, using blank startup frame\n");
+		memset(&rptr->buf, 0x00, sizeof(rptr->buf));
+	}
+	else
+	{
+		size_t bytes_read = fread(&rptr->buf, 1, sizeof(rptr->buf), fp);
+		if (bytes_read < sizeof(rptr->buf))
+		{
+			if (ferror(fp))
+			{
+				perror("Warning: Failed to fully read testframe.bgra");
+			}
+			memset(((unsigned char *)&rptr->buf) + bytes_read, 0x00, sizeof(rptr->buf) - bytes_read);
+		}
 
-	fread(&rptr->buf, 307200, 1, fp);
+		fclose(fp);
+	}
+
 	rptr->full = 1;
 	
 	memset(&outbuf[0], 0x00, sizeof(PPUFrame));
