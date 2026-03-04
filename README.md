@@ -14,6 +14,7 @@ The folders are as follows :
 * **Nesrom** - Source code for the PRG ROM used to set up the PPU and handle frame sync, controller input, and music.
 * **OS** - Buildroot configuration for the custom linux distribution that runs on the Pi/
 * **PPUSquirt** - Source code for the program that handles graphics conversion and PPU communication. Runs on the Pi.
+* **docs/build-environment** - Per-component build environment guides, split by OS where practical.
 
 
 ## Tech Info ##
