@@ -134,14 +134,6 @@ void setpixel(char *frameBuf, unsigned int x, unsigned int y, unsigned char r, u
 	*(frameBuf + off + 2) = r;
 }
 
-/*long ColorDistance(Color color1, Color color2)
-{
-	return (
-		S((signed int)color1.r - (signed int)color2.r) +
-		S((signed int)color1.g - (signed int)color2.g) +
-		S((signed int)color1.b - (signed int)color2.b));
-}*/
-
 // Compare the difference of two RGB values, weigh by CCIR 601 luminosity
 float WeightedColorDistance(Color color1, Color color2)
 {
@@ -268,7 +260,6 @@ int FindBestPalForSlice(char *bmp, unsigned int xoff, unsigned int yoff)
 	for (x = xoff; x < xoff + 8; x += 1)
 	{
 		getpixel(bmp, x, y, &currPix.r, &currPix.g, &currPix.b);
-		//bestPal = FindBestPalForPixel(currPix);
 		bestPal = PaletteLookup[currPix.r][currPix.g][currPix.b];
 
 		if (bestPal != -1)
@@ -311,15 +302,6 @@ void GFXSetup()
 	char *dummy = 0;
 	FILE *fp;
 	size_t n;
-
-	// Load Palette from external file 
-	// disabled because it doesn't look as good as this internal one for some reason
-	/*if (fp = fopen("ntscpalette.pal", "r"))
-	{
-		if ((n = fread(&NesPalette, 1, 64*3, fp)) != (64*3)){ printf("exit : %lu\n", n); exit(1); }
-		fclose(fp);
-	}*/
-
 
 	// Generate NES palette from the string info
 	for (i = 0; i < 64; i++)
@@ -387,102 +369,6 @@ void GFXSetup()
 	pmdata->Palettes[3][1] = 0x16;
 	pmdata->Palettes[3][2] = 0x3d;
 
-	//Low Intensity RGB
-	/*pmdata->Palettes[0][0] = 0x16;
-	pmdata->Palettes[0][1] = 0x19;
-	pmdata->Palettes[0][2] = 0x11;
-
-	//Med Intensity RGB
-	pmdata->Palettes[1][0] = 0x26;
-	pmdata->Palettes[1][1] = 0x29;
-	pmdata->Palettes[1][2] = 0x21;
-
-	//High Intensity RGB
-	pmdata->Palettes[2][0] = 0x36;
-	pmdata->Palettes[2][1] = 0x39;
-	pmdata->Palettes[2][2] = 0x31;
-
-	//greys and white
-	pmdata->Palettes[3][0] = 0x2D;
-	pmdata->Palettes[3][1] = 0x3D;
-	pmdata->Palettes[3][2] = 0x20;*/
-
-	//R
-	/*pmdata->Palettes[0][0] = 0x06;
-	pmdata->Palettes[0][1] = 0x16;
-	pmdata->Palettes[0][2] = 0x26;
-
-	//G
-	pmdata->Palettes[1][0] = 0x09;
-	pmdata->Palettes[1][1] = 0x19;
-	pmdata->Palettes[1][2] = 0x29;
-
-	//B
-	pmdata->Palettes[2][0] = 0x01;
-	pmdata->Palettes[2][1] = 0x11;
-	pmdata->Palettes[2][2] = 0x21;
-
-	//greys and white
-	pmdata->Palettes[3][0] = 0x2D;
-	pmdata->Palettes[3][1] = 0x3D;
-	pmdata->Palettes[3][2] = 0x20;*/
-
-	//R + white
-	/*pmdata->Palettes[0][0] = 0x06;
-	pmdata->Palettes[0][1] = 0x16;
-	pmdata->Palettes[0][2] = 0x36;
-
-	//G + white
-	pmdata->Palettes[1][0] = 0x0a;
-	pmdata->Palettes[1][1] = 0x1a;
-	pmdata->Palettes[1][2] = 0x3a;
-
-	//B + white
-	pmdata->Palettes[2][0] = 0x01;
-	pmdata->Palettes[2][1] = 0x11;
-	pmdata->Palettes[2][2] = 0x31;
-
-	//greys and white
-	pmdata->Palettes[3][0] = 0x2D;
-	pmdata->Palettes[3][1] = 0x3D;
-	pmdata->Palettes[3][2] = 0x20;*/
-
-	//RGW
-	/*pmdata->Palettes[0][0] = 0x16;
-	pmdata->Palettes[0][1] = 0x19;
-	pmdata->Palettes[0][2] = 0x20;
-
-	//GBW
-	pmdata->Palettes[1][0] = 0x19;
-	pmdata->Palettes[1][1] = 0x11;
-	pmdata->Palettes[1][2] = 0x20;
-
-	//RBW
-	pmdata->Palettes[2][0] = 0x16;
-	pmdata->Palettes[2][1] = 0x11;
-	pmdata->Palettes[2][2] = 0x20;
-
-	//greys and white
-	pmdata->Palettes[3][0] = 0x2D;
-	pmdata->Palettes[3][1] = 0x3D;
-	pmdata->Palettes[3][2] = 0x20;*/
-
-	//black for bg
-	/*BgColor = 0x0f;
-
-	pmdata->Palettes[0][0] = 0x02;
-	pmdata->Palettes[0][1] = 0x22;
-	pmdata->Palettes[0][2] = 0x24;
-	pmdata->Palettes[1][0] = 0x14;
-	pmdata->Palettes[1][1] = 0x16;
-	pmdata->Palettes[1][2] = 0x26;
-	pmdata->Palettes[2][0] = 0x28;
-	pmdata->Palettes[2][1] = 0x18;
-	pmdata->Palettes[2][2] = 0x1a;
-	pmdata->Palettes[3][0] = 0x2a;
-	pmdata->Palettes[3][1] = 0x2c;
-	pmdata->Palettes[3][2] = 0x1c;*/
-
 	// Pre-gen contrast factor
 	contrastFactor = (259 * (contrast + 255)) / (255 * (259 - contrast));
 
@@ -492,7 +378,7 @@ void GFXSetup()
 
 	// build palette lookup tables to trade memory for speed
 	// Try to open them from last time if possible
-	if (fp = fopen("lookup.bin", "r"))
+	if ((fp = fopen("lookup.bin", "r")))
 	{
 		if ((n = fread(&PaletteLookup, 1, 256 * 256 * 256, fp)) != (256 * 256 * 256)){ printf("exit : %lu\n", n); exit(1); }
 		if ((n = fread(&ColorLookup, 1, 256 * 256 * 256 * 4, fp)) != (256 * 256 * 256 * 4)){ printf("exit2 : %lu\n", n); exit(1); }
@@ -622,7 +508,6 @@ void FitFrame(char *bmp, PPUFrame *theFrame, int startline, int endline)
 				getpixel(bmp, x, y, &currPix.r, &currPix.g, &currPix.b);
 
 				// find closest color match from palette we chose
-				//bestcol = FindBestColorMatchFromPalette(currPix, pmdata->Palettes[palToUse], BgColor); // Slow but dynamic palette
 				bestcol = ColorLookup[currPix.r][currPix.g][currPix.b][palToUse]; // Quick but locked to one palette
 
 				// Shift the index up one, so -1 becomes zero, which is how it will appear in the nes palette
