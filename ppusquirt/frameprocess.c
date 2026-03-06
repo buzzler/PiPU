@@ -23,20 +23,33 @@ double contrastFactor, contrast = 50;
 #define BRIGHTNESS 30
 Colmatch MostCommonColorInFrame[NESCOLORCOUNT];
 
-// Massive pre-calculated color lookup tables - Baseline FPS 82
-unsigned char PaletteLookup[256][256][256]; // for matching a color to a palette
-signed char ColorLookup[256][256][256][4];  // For matching to a color within the palette
+// 16-bit lookup tables to keep runtime conversion fast while supporting dynamic palette updates.
+// RGB565 keeps memory footprint manageable while allowing very quick palette refresh.
+signed char PaletteLookup565[65536];       // for matching a color to a palette
+signed char ColorLookup565[65536][4];      // for matching to a color within each palette
+unsigned short ErrorLookup565[65536][4];   // quantized color error for each palette
 
-// Ordered dither map
-double map[8][8] = {
-	{0, 48, 12, 60, 3, 51, 15, 63},
-	{32, 16, 44, 28, 35, 19, 47, 31},
-	{8, 56, 4, 52, 11, 59, 7, 55},
-	{40, 24, 36, 20, 43, 27, 39, 23},
-	{2, 50, 14, 62, 1, 49, 13, 61},
-	{34, 18, 46, 30, 33, 17, 45, 29},
-	{10, 58, 6, 54, 9, 57, 5, 53},
-	{42, 26, 38, 22, 41, 25, 37, 21}};
+unsigned char ActivePalettes[4][3];
+unsigned char ActiveBgColor = 0x0f;
+unsigned int FrameCounter = 0;
+unsigned int LastPaletteUpdateFrame = 0;
+
+#define PALETTE_UPDATE_INTERVAL 8
+#define PALETTE_UPDATE_HYSTERESIS 0.92
+
+unsigned char SatAdd8(signed short n1, signed short n2);
+signed char FindBestPalForPixel(Color currPix);
+
+// Blue-noise-like dither map (0..63), less structured artifacts than classic Bayer.
+unsigned char map[8][8] = {
+	{0, 40, 12, 52, 3, 43, 15, 55},
+	{32, 24, 44, 20, 35, 27, 47, 23},
+	{8, 56, 4, 60, 11, 59, 7, 63},
+	{36, 16, 48, 28, 39, 19, 51, 31},
+	{2, 42, 14, 54, 1, 41, 13, 53},
+	{34, 26, 46, 22, 33, 25, 45, 21},
+	{10, 58, 6, 62, 9, 57, 5, 61},
+	{38, 18, 50, 30, 37, 17, 49, 29}};
 
 // Nes Palette in string format, will be converted later on
 char NesPaletteStrings[NESCOLORCOUNT][6] =
@@ -190,19 +203,205 @@ int FindBestColorMatchFromPalette(Color theColor, unsigned char *Palette, int bg
 	return bestColorSoFar;
 }
 
-typedef struct Palmatch
+static inline unsigned short RGBTo565(unsigned char r, unsigned char g, unsigned char b)
 {
+	return (unsigned short)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
 
-	unsigned char palNo;
-	int frequency;
-
-} Palmatch;
-
-int ComparePalMatch(const void *s1, const void *s2)
+static inline Color RGB565To888(unsigned short rgb565)
 {
-	Palmatch *e1 = (Palmatch *)s1;
-	Palmatch *e2 = (Palmatch *)s2;
-	return e1->frequency - e2->frequency;
+	Color c;
+	c.r = (unsigned char)((rgb565 >> 8) & 0xF8);
+	c.g = (unsigned char)((rgb565 >> 3) & 0xFC);
+	c.b = (unsigned char)((rgb565 << 3) & 0xF8);
+	return c;
+}
+
+unsigned short QuantizeError(float e)
+{
+	if (e <= 0)
+		return 0;
+	if (e >= 1.0f)
+		return 65535;
+	return (unsigned short)(e * 65535.0f);
+}
+
+float PaletteError(Color px, unsigned char paletteNo, unsigned char palettes[4][3], unsigned char bg)
+{
+	float bestScore = WeightedColorDistance(NesPalette[bg], px);
+
+	for (int col = 0; col < 3; col++)
+	{
+		float dist = WeightedColorDistance(NesPalette[palettes[paletteNo][col]], px);
+		if (dist < bestScore)
+		{
+			bestScore = dist;
+		}
+	}
+
+	return bestScore;
+}
+
+void CopyActivePaletteToSharedMemory(void)
+{
+	BgColor = ActiveBgColor;
+	for (int p = 0; p < 4; p++)
+	{
+		for (int c = 0; c < 3; c++)
+		{
+			pmdata->Palettes[p][c] = ActivePalettes[p][c];
+		}
+	}
+}
+
+void RefreshLookupTables(void)
+{
+	for (int i = 0; i < 65536; i++)
+	{
+		Color col = RGB565To888((unsigned short)i);
+		PaletteLookup565[i] = FindBestPalForPixel(col);
+
+		for (int p = 0; p < 4; p++)
+		{
+			ColorLookup565[i][p] = FindBestColorMatchFromPalette(col, ActivePalettes[p], ActiveBgColor);
+			ErrorLookup565[i][p] = QuantizeError(PaletteError(col, (unsigned char)p, ActivePalettes, ActiveBgColor));
+		}
+	}
+}
+
+float EstimateFrameError(char *bmp, unsigned char palettes[4][3], unsigned char bg)
+{
+	float total = 0.0f;
+	Color px;
+	for (int y = 0; y < 240; y += 2)
+	{
+		for (int x = 0; x < 256; x += 2)
+		{
+			getpixel(bmp, x, y, &px.r, &px.g, &px.b);
+			px.r = SatAdd8(px.r, BRIGHTNESS);
+			px.g = SatAdd8(px.g, BRIGHTNESS);
+			px.b = SatAdd8(px.b, BRIGHTNESS);
+			px.r = SatAdd8(contrastFactor * ((double)px.r - 128), 128);
+			px.g = SatAdd8(contrastFactor * ((double)px.g - 128), 128);
+			px.b = SatAdd8(contrastFactor * ((double)px.b - 128), 128);
+
+			float best = PaletteError(px, 0, palettes, bg);
+			for (int p = 1; p < 4; p++)
+			{
+				float err = PaletteError(px, (unsigned char)p, palettes, bg);
+				if (err < best)
+					best = err;
+			}
+			total += best;
+		}
+	}
+	return total;
+}
+
+void BuildCandidatePalette(char *bmp, unsigned char candidate[4][3], unsigned char *candidateBg)
+{
+	int freq[NESCOLORCOUNT] = {0};
+	Color px;
+
+	for (int y = 0; y < 240; y += 2)
+	{
+		for (int x = 0; x < 256; x += 2)
+		{
+			getpixel(bmp, x, y, &px.r, &px.g, &px.b);
+			px.r = SatAdd8(px.r, BRIGHTNESS);
+			px.g = SatAdd8(px.g, BRIGHTNESS);
+			px.b = SatAdd8(px.b, BRIGHTNESS);
+			px.r = SatAdd8(contrastFactor * ((double)px.r - 128), 128);
+			px.g = SatAdd8(contrastFactor * ((double)px.g - 128), 128);
+			px.b = SatAdd8(contrastFactor * ((double)px.b - 128), 128);
+			freq[FindBestColorMatch(px)]++;
+		}
+	}
+
+	int bestColor = ActiveBgColor;
+	for (int i = 0; i < NESCOLORCOUNT; i++)
+	{
+		if (freq[i] > freq[bestColor])
+		{
+			bestColor = i;
+		}
+	}
+
+	if (freq[bestColor] > (int)(freq[ActiveBgColor] * 1.15f))
+		*candidateBg = (unsigned char)bestColor;
+	else
+		*candidateBg = ActiveBgColor;
+
+	int picks[12];
+	int pickCount = 0;
+	for (int p = 0; p < 12; p++)
+		picks[p] = -1;
+
+	while (pickCount < 12)
+	{
+		int best = -1;
+		for (int i = 0; i < NESCOLORCOUNT; i++)
+		{
+			if (i == *candidateBg)
+				continue;
+			int already = 0;
+			for (int j = 0; j < pickCount; j++)
+			{
+				if (picks[j] == i)
+				{
+					already = 1;
+					break;
+				}
+			}
+			if (already)
+				continue;
+
+			if (best == -1 || freq[i] > freq[best])
+				best = i;
+		}
+
+		if (best == -1)
+			break;
+
+		picks[pickCount++] = best;
+	}
+
+	for (int p = 0; p < 4; p++)
+	{
+		for (int c = 0; c < 3; c++)
+		{
+			int idx = p * 3 + c;
+			if (idx < pickCount)
+				candidate[p][c] = (unsigned char)picks[idx];
+			else
+				candidate[p][c] = ActivePalettes[p][c];
+		}
+	}
+}
+
+void MaybeRefreshDynamicPalette(char *bmp)
+{
+	if (FrameCounter - LastPaletteUpdateFrame < PALETTE_UPDATE_INTERVAL)
+		return;
+
+	unsigned char candidate[4][3];
+	unsigned char candidateBg = ActiveBgColor;
+	BuildCandidatePalette(bmp, candidate, &candidateBg);
+
+	float currentErr = EstimateFrameError(bmp, ActivePalettes, ActiveBgColor);
+	float candidateErr = EstimateFrameError(bmp, candidate, candidateBg);
+
+	if (candidateErr < currentErr * PALETTE_UPDATE_HYSTERESIS)
+	{
+		for (int p = 0; p < 4; p++)
+			for (int c = 0; c < 3; c++)
+				ActivePalettes[p][c] = candidate[p][c];
+		ActiveBgColor = candidateBg;
+		CopyActivePaletteToSharedMemory();
+		RefreshLookupTables();
+	}
+
+	LastPaletteUpdateFrame = FrameCounter;
 }
 
 signed char FindBestPalForPixel(Color currPix)
@@ -216,7 +415,7 @@ signed char FindBestPalForPixel(Color currPix)
 	bestPal = -1;
 
 	// check the bgcolor first
-	bestDist = WeightedColorDistance(NesPalette[BgColor], currPix);
+	bestDist = WeightedColorDistance(NesPalette[ActiveBgColor], currPix);
 
 	double dist;
 
@@ -227,7 +426,7 @@ signed char FindBestPalForPixel(Color currPix)
 		{
 			for (col = 0; col < 3; col++)
 			{
-				dist = WeightedColorDistance(NesPalette[pmdata->Palettes[p][col]], currPix);
+					dist = WeightedColorDistance(NesPalette[ActivePalettes[p][col]], currPix);
 				if (dist < bestDist)
 				{
 					bestDist = dist;
@@ -241,36 +440,28 @@ signed char FindBestPalForPixel(Color currPix)
 
 int FindBestPalForSlice(char *bmp, unsigned int xoff, unsigned int yoff)
 {
-	signed char bestPal;
-
-	int j;
-	unsigned int x, y;
+	unsigned int x;
+	unsigned int bestPal = 0;
+	unsigned int bestError = 0xffffffff;
 	Color currPix;
-	Palmatch PalMatches[4];
 
-	y = yoff;
-
-	// init matches table
-	for (j = 0; j < 4; j++)
+	for (int p = 0; p < 4; p++)
 	{
-		PalMatches[j].palNo = j;
-		PalMatches[j].frequency = 0;
-	}
-
-	for (x = xoff; x < xoff + 8; x += 1)
-	{
-		getpixel(bmp, x, y, &currPix.r, &currPix.g, &currPix.b);
-		bestPal = PaletteLookup[currPix.r][currPix.g][currPix.b];
-
-		if (bestPal != -1)
+		unsigned int total = 0;
+		for (x = xoff; x < xoff + 8; x++)
 		{
-			PalMatches[bestPal].frequency++;
+			getpixel(bmp, x, yoff, &currPix.r, &currPix.g, &currPix.b);
+			total += ErrorLookup565[RGBTo565(currPix.r, currPix.g, currPix.b)][p];
+		}
+
+		if (total < bestError)
+		{
+			bestError = total;
+			bestPal = (unsigned int)p;
 		}
 	}
 
-	qsort(PalMatches, 4, sizeof(Palmatch), ComparePalMatch);
-
-	return PalMatches[3].palNo;
+	return (int)bestPal;
 }
 
 long CompareColMatch(const void *s1, const void *s2)
@@ -295,13 +486,11 @@ unsigned char SatAdd8(signed short n1, signed short n2)
 void GFXSetup()
 {
 
-	int i, j;
+	int i;
 
 	char curHex[3] = {0x00, 0x00, 0x00};
 	char *curCol;
 	char *dummy = 0;
-	FILE *fp;
-	size_t n;
 
 	// Generate NES palette from the string info
 	for (i = 0; i < 64; i++)
@@ -321,15 +510,6 @@ void GFXSetup()
 		NesPalette[i].b = (unsigned char)strtoul(curHex, &dummy, 16);
 	}
 
-	// Generate ordered dither map
-	for (i = 0; i < 8; i++)
-	{
-		for (j = 0; j < 8; j++)
-		{
-			map[i][j] = (double)60 * (((double)map[i][j] / (double)64) - 0.5);
-		}
-	}
-
 	// Open palette/music shared memory area
 	int fd;
 	fd = shm_open("/palmusdata", O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
@@ -347,73 +527,34 @@ void GFXSetup()
 	// Default DOOM Palette
 
 	//black for bg
-	BgColor = 0x0f;
+	ActiveBgColor = 0x0f;
 
 	//dark greys + green
-	pmdata->Palettes[0][0] = 0x10;
-	pmdata->Palettes[0][1] = 0x09;
-	pmdata->Palettes[0][2] = 0x2d;
+	ActivePalettes[0][0] = 0x10;
+	ActivePalettes[0][1] = 0x09;
+	ActivePalettes[0][2] = 0x2d;
 
 	//oranges
-	pmdata->Palettes[1][0] = 0x07;
-	pmdata->Palettes[1][1] = 0x28;
-	pmdata->Palettes[1][2] = 0x18;
+	ActivePalettes[1][0] = 0x07;
+	ActivePalettes[1][1] = 0x28;
+	ActivePalettes[1][2] = 0x18;
 
 	//blues
-	pmdata->Palettes[2][0] = 0x02;
-	pmdata->Palettes[2][1] = 0x01;
-	pmdata->Palettes[2][2] = 0x11;
+	ActivePalettes[2][0] = 0x02;
+	ActivePalettes[2][1] = 0x01;
+	ActivePalettes[2][2] = 0x11;
 
 	//reds and light grey
-	pmdata->Palettes[3][0] = 0x06;
-	pmdata->Palettes[3][1] = 0x16;
-	pmdata->Palettes[3][2] = 0x3d;
+	ActivePalettes[3][0] = 0x06;
+	ActivePalettes[3][1] = 0x16;
+	ActivePalettes[3][2] = 0x3d;
+
+	CopyActivePaletteToSharedMemory();
 
 	// Pre-gen contrast factor
 	contrastFactor = (259 * (contrast + 255)) / (255 * (259 - contrast));
 
-	Color col;
-
-
-
-	// build palette lookup tables to trade memory for speed
-	// Try to open them from last time if possible
-	if ((fp = fopen("lookup.bin", "r")))
-	{
-		if ((n = fread(&PaletteLookup, 1, 256 * 256 * 256, fp)) != (256 * 256 * 256)){ printf("exit : %lu\n", n); exit(1); }
-		if ((n = fread(&ColorLookup, 1, 256 * 256 * 256 * 4, fp)) != (256 * 256 * 256 * 4)){ printf("exit2 : %lu\n", n); exit(1); }
-		fclose(fp);
-	}
-	// If not, generate from scratch (takes 30sec or so)
-	else
-	{
-		for (int r = 0; r < 256; r++)
-		{
-			for (int g = 0; g < 256; g++)
-			{
-				for (int b = 0; b < 256; b++)
-				{
-					col.r = r;
-					col.g = g;
-					col.b = b;
-					PaletteLookup[r][g][b] = FindBestPalForPixel(col);
-
-					for (int p = 0; p < 4; p++)
-					{
-						ColorLookup[r][g][b][p] = FindBestColorMatchFromPalette(col, pmdata->Palettes[p], BgColor);
-					}
-				}
-			}
-			printf("%d / 256 - %d\n", r, PaletteLookup[r][255][255]);
-		}
-
-		//Save the lookup tables for next time
-		fp = fopen("lookup.bin", "w+");
-
-		fwrite(&PaletteLookup, 256 * 256 * 256, 1, fp);
-		fwrite(&ColorLookup, 256 * 256 * 256 * 4, 1, fp);
-		fclose(fp);
-	}
+	RefreshLookupTables();
 }
 
 // Convert a single frame segment to NES format
@@ -428,24 +569,27 @@ void FitFrame(char *bmp, PPUFrame *theFrame, int startline, int endline)
 
 	if (startline == 0)
 	{
+		FrameCounter++;
+		MaybeRefreshDynamicPalette(bmp);
+
 		theFrame->OtherData[0] = 0x54;
 		theFrame->OtherData[1] = 0x17; // Magic value
-		theFrame->OtherData[2] = BgColor;
-		theFrame->OtherData[3] = pmdata->Palettes[0][0];
-		theFrame->OtherData[4] = pmdata->Palettes[0][1];
-		theFrame->OtherData[5] = pmdata->Palettes[0][2];
+		theFrame->OtherData[2] = ActiveBgColor;
+		theFrame->OtherData[3] = ActivePalettes[0][0];
+		theFrame->OtherData[4] = ActivePalettes[0][1];
+		theFrame->OtherData[5] = ActivePalettes[0][2];
 		theFrame->OtherData[6] = 0;
-		theFrame->OtherData[7] = pmdata->Palettes[1][0];
-		theFrame->OtherData[8] = pmdata->Palettes[1][1];
-		theFrame->OtherData[9] = pmdata->Palettes[1][2];
+		theFrame->OtherData[7] = ActivePalettes[1][0];
+		theFrame->OtherData[8] = ActivePalettes[1][1];
+		theFrame->OtherData[9] = ActivePalettes[1][2];
 		theFrame->OtherData[10] = 0;
-		theFrame->OtherData[11] = pmdata->Palettes[2][0];
-		theFrame->OtherData[12] = pmdata->Palettes[2][1];
-		theFrame->OtherData[13] = pmdata->Palettes[2][2];
+		theFrame->OtherData[11] = ActivePalettes[2][0];
+		theFrame->OtherData[12] = ActivePalettes[2][1];
+		theFrame->OtherData[13] = ActivePalettes[2][2];
 		theFrame->OtherData[14] = 0;
-		theFrame->OtherData[15] = pmdata->Palettes[3][0];
-		theFrame->OtherData[16] = pmdata->Palettes[3][1];
-		theFrame->OtherData[17] = pmdata->Palettes[3][2];
+		theFrame->OtherData[15] = ActivePalettes[3][0];
+		theFrame->OtherData[16] = ActivePalettes[3][1];
+		theFrame->OtherData[17] = ActivePalettes[3][2];
 		theFrame->OtherData[20] = pmdata->music; // Play E1M1 music
 		theFrame->OtherData[30] = 0xBE;
 		theFrame->OtherData[31] = 0xEF; // Magic Value
@@ -454,6 +598,30 @@ void FitFrame(char *bmp, PPUFrame *theFrame, int startline, int endline)
 	// First apply dithering and brightness/contrast adjustment
 	for (y = startline; y < endline; y++)
 	{
+		unsigned char ditherStrength[32];
+		for (i = 0; i < 32; i++)
+		{
+			unsigned char minLum = 255;
+			unsigned char maxLum = 0;
+			for (x = i * 8; x < (i * 8) + 8; x++)
+			{
+				getpixel(bmp, x, y, &currPix.r, &currPix.g, &currPix.b);
+				unsigned char lum = (unsigned char)((currPix.r * 3 + currPix.g * 6 + currPix.b) / 10);
+				if (lum < minLum)
+					minLum = lum;
+				if (lum > maxLum)
+					maxLum = lum;
+			}
+
+			unsigned char range = maxLum - minLum;
+			if (range < 18)
+				ditherStrength[i] = 8;
+			else if (range < 48)
+				ditherStrength[i] = 18;
+			else
+				ditherStrength[i] = 30;
+		}
+
 		for (x = 0; x < 256; x++)
 		{
 			getpixel(bmp, x, y, &currPix.r, &currPix.g, &currPix.b);
@@ -468,10 +636,11 @@ void FitFrame(char *bmp, PPUFrame *theFrame, int startline, int endline)
 			currPix.g = SatAdd8(contrastFactor * ((double)currPix.g - 128), 128);
 			currPix.b = SatAdd8(contrastFactor * ((double)currPix.b - 128), 128);
 
-			// Ordered Dither
-			currPix.r = SatAdd8(currPix.r, map[x % 8][y % 8]);
-			currPix.g = SatAdd8(currPix.g, map[x % 8][y % 8]);
-			currPix.b = SatAdd8(currPix.b, map[x % 8][y % 8]);
+			// Adaptive ordered dither with blue-noise-like matrix.
+			int dither = ((int)map[x % 8][y % 8] - 32) * ditherStrength[x / 8] / 32;
+			currPix.r = SatAdd8(currPix.r, dither);
+			currPix.g = SatAdd8(currPix.g, dither);
+			currPix.b = SatAdd8(currPix.b, dither);
 			setpixel(bmp, x, y, currPix.r, currPix.g, currPix.b);
 		}
 	}
@@ -508,7 +677,7 @@ void FitFrame(char *bmp, PPUFrame *theFrame, int startline, int endline)
 				getpixel(bmp, x, y, &currPix.r, &currPix.g, &currPix.b);
 
 				// find closest color match from palette we chose
-				bestcol = ColorLookup[currPix.r][currPix.g][currPix.b][palToUse]; // Quick but locked to one palette
+				bestcol = ColorLookup565[RGBTo565(currPix.r, currPix.g, currPix.b)][palToUse]; // Quick and palette-refresh friendly
 
 				// Shift the index up one, so -1 becomes zero, which is how it will appear in the nes palette
 				bestcol++;
